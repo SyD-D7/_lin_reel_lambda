@@ -1,0 +1,130 @@
+import json
+import boto3
+import uuid
+import requests
+import os
+from io import BytesIO
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+users_table = dynamodb.Table('Users')
+reels_table = dynamodb.Table('Reels')
+s3 = boto3.client('s3')
+lintoreelbucket = os.environ.get('S3_lintoreelbucket')
+
+def generate_unique_id():
+    return str(uuid.uuid4())
+
+def generate_presigned_url(lintoreelbucket, key, expiration=3600):  # Default expiration: 1 hour
+    try:
+        response = s3.generate_presigned_url('get_object',
+                                            Params={'Bucket': lintoreelbucket, 'Key': key},
+                                            ExpiresIn=expiration)
+        return response
+    except Exception as e:
+        print(f"Error generating presigned URL: {e}")
+        return None
+
+def lambda_handler(event, context):
+    print(event)
+    body = {}
+    statusCode = 200
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        route_key = event['routeKey']
+
+        # UserCRUD( no changes)
+
+        elif route_key == 'POST /reels':
+            request_body = json.loads(event['body'])
+            video_url_from_request = request_body.get('videoUrl')
+
+            if not video_url_from_request:
+                statusCode = 400
+                body = {'message': 'videoUrl is required'}
+                return create_response(statusCode, body)
+
+            try:
+                video_response = requests.get(video_url_from_request, stream=True)
+                video_response.raise_for_status()
+
+                video_content = BytesIO(video_response.content)
+                reel_id = generate_unique_id()
+                s3_key = f"reels/{reel_id}.mp4"
+
+                s3.upload_fileobj(video_content, lintoreelbucket, s3_key, ExtraArgs={'ContentType': 'video/mp4'})
+
+                # getting the presigned URL
+                presigned_url = generate_presigned_url(lintoreelbucket, s3_key)
+
+                if not presigned_url:
+                  statusCode = 500
+                  body = {'message': 'Failed to generate presigned URL'}
+                  return create_response(statusCode, body)
+
+
+                reel = {
+                    'id': reel_id,
+                    'userId': request_body.get('userId'),
+                    'videoUrl': presigned_url,  # Store presigned URL
+                    'description': request_body.get('description'),
+                    'likes': request_body.get('likes', 0),
+                    'createdAt': datetime.utcnow().isoformat() + 'Z'
+                }
+                reels_table.put_item(Item=reel)
+                body = {'reelId': reel_id, 'videoUrl': presigned_url} # Return the presigned URL in the response as well
+            except requests.exceptions.RequestException as e:
+                statusCode = 400
+                body = {'message': f'Error downloading video: {e}'}
+                return create_response(statusCode, body)
+            except Exception as e:
+                statusCode = 500
+                body = {'message': f'Error uploading to S3 or creating reel: {e}'}
+                return create_response(statusCode, body)
+
+        # ... (Other Reel CRUD operations - no changes)
+
+        elif route_key == 'GET /reels/{id}':  # Get Reel by ID and return presigned URL
+            reel_id = event['pathParameters']['id']
+            response = reels_table.get_item(Key={'id': reel_id})
+            if 'Item' in response:
+                reel = response['Item']
+                s3_key = reel['videoUrl'].split(f"https://lintoreelbucket.s3.amazonaws.com/")[1] # Extract key from url
+                presigned_url = generate_presigned_url(lintoreelbucket, s3_key)
+                if presigned_url:
+                  reel['videoUrl'] = presigned_url
+                body = reel
+            else:
+                statusCode = 404
+                body = {'message': 'Reel not found'}
+
+        else:
+            statusCode = 400
+            body = {'message': 'Invalid route'}
+
+    except KeyError as e:
+        statusCode = 400
+        body = {'message': f'Missing key: {e}'}
+    except json.JSONDecodeError:
+        statusCode = 400
+        body = {'message': 'Invalid JSON in request body'}
+    except Exception as e:
+        statusCode = 500
+        print(f"Error: {e}")
+        body = {'message': 'Internal server error'}
+
+    return create_response(statusCode, body)
+
+def create_response(status_code, body):
+    body = json.dumps(body, default=str)
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json'
+        },
+        'body': body
+    }
+    
